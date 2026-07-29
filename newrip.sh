@@ -22,6 +22,17 @@ POLL_INTERVAL=10
 
 LOCKFILE="$SRC/.watchdog.lock"
 
+# Config file (holds OMDB_API_URL, with the key embedded). Kept out
+# of this script so it's not something you'd accidentally paste into
+# a public repo/gist.
+CONF_FILE="$(dirname "$(readlink -f "$0")")/watchdog.conf"
+
+OMDB_API_URL=""
+if [[ -f "$CONF_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONF_FILE"
+fi
+
 # ---------------- Colours ----------------
 
 AMBER='\033[38;5;214m'
@@ -134,22 +145,108 @@ sanitize_name() {
     tr -cd '[:alnum:]_.-'
 }
 
+# Strips common disc-label junk (quality tags, edition markers,
+# disc numbers, dots/underscores) down to a plausible movie title
+# to use as an OMDb search query.
+clean_label() {
+
+    local raw="$1"
+    local cleaned
+
+    cleaned=$(tr '_.' '  ' <<< "$raw")
+
+    # Drop a trailing 4-digit year for now — OMDb searches better
+    # on title alone and we re-attach the year from the API result.
+    cleaned=$(sed -E 's/\b(19|20)[0-9]{2}\b//g' <<< "$cleaned")
+
+    cleaned=$(sed -E \
+        -e 's/\b(1080p|2160p|720p|480p|4k|uhd|hdr|hd)\b//Ig' \
+        -e 's/\b(bluray|blu-ray|bdrip|brrip|dvdrip|dvd|webrip|web-dl)\b//Ig' \
+        -e 's/\b(x264|x265|h264|h265|hevc|avc)\b//Ig' \
+        -e 's/\b(remux|extended|unrated|directors?\s?cut|theatrical)\b//Ig' \
+        -e 's/\b(disc|disk|cd|dvd)\s?[0-9]+\b//Ig' \
+        -e 's/[[:space:]]+/ /g' \
+        <<< "$cleaned"
+    )
+
+    # Trim leading/trailing whitespace
+    cleaned="${cleaned#"${cleaned%%[![:space:]]*}"}"
+    cleaned="${cleaned%"${cleaned##*[![:space:]]}"}"
+
+    printf "%s" "$cleaned"
+}
+
+# Looks up a cleaned title on OMDb. Prints "Title (Year)" on a
+# match, prints nothing on any failure (no key, no network, no
+# match) so the caller can fall back cleanly.
+omdb_lookup() {
+
+    local query="$1"
+
+    [[ -z "$OMDB_API_URL" ]] && return 1
+    command -v curl >/dev/null 2>&1 || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    [[ -z "$query" ]] && return 1
+
+    local encoded response title year response_type
+
+    encoded=$(jq -rn --arg s "$query" '$s|@uri')
+
+    response=$(curl -s -m 8 \
+        "${OMDB_API_URL}&t=${encoded}&type=movie")
+
+    [[ -z "$response" ]] && return 1
+
+    response_type=$(jq -r '.Response // "False"' <<< "$response" 2>/dev/null)
+
+    [[ "$response_type" != "True" ]] && return 1
+
+    title=$(jq -r '.Title // empty' <<< "$response" 2>/dev/null)
+    year=$(jq -r '.Year // empty' <<< "$response" 2>/dev/null)
+
+    [[ -z "$title" ]] && return 1
+
+    if [[ -n "$year" ]]; then
+        printf "%s (%s)" "$title" "$year"
+    else
+        printf "%s" "$title"
+    fi
+}
+
 choose_name() {
 
     local file="$1"
 
-    local disc_label
+    local disc_label cleaned omdb_result
 
-    disc_label=$(
-        lsblk -dno LABEL "$DEV" 2>/dev/null |
-        sanitize_name
-    )
+    disc_label=$(lsblk -dno LABEL "$DEV" 2>/dev/null)
 
     if [[ -n "$disc_label" ]]; then
-        printf "%s" "$disc_label"
-    else
-        basename "$file" .mkv
+
+        cleaned=$(clean_label "$disc_label")
+
+        omdb_result=$(omdb_lookup "$cleaned")
+
+        if [[ -n "$omdb_result" ]]; then
+            OMDB_MATCHED=true
+            sanitize_name <<< "$omdb_result"
+            return
+        fi
+
+        OMDB_MATCHED=false
+
+        if [[ -n "$cleaned" ]]; then
+            sanitize_name <<< "$cleaned"
+            return
+        fi
+
+        sanitize_name <<< "$disc_label"
+        return
+
     fi
+
+    OMDB_MATCHED=false
+    basename "$file" .mkv
 }
 
 # Renders a real progress bar, not just a percentage number
@@ -326,9 +423,17 @@ rip_current_disc() {
 
     SIZE_HUMAN=$(du -h "$FILE" | cut -f1)
 
+    OMDB_MATCHED=false
     NAME=$(choose_name "$FILE")
 
     section "Importing"
+
+    if [[ "$OMDB_MATCHED" == true ]]; then
+        ok "Matched on OMDb."
+    else
+        warn "No OMDb match — using cleaned disc label."
+    fi
+
     info "Selected main feature: ${WHITE}${BOLD}${NAME}${RESET} ${GRAY}(${SIZE_HUMAN})${RESET}"
 
     TARGET="$DST/$NAME"
@@ -444,6 +549,16 @@ ok "Optical drive detected. ${GRAY}(${DEV})${RESET}"
 if ! command -v flock >/dev/null 2>&1
 then
     warn "flock not found — single-instance lock is disabled."
+fi
+
+if [[ -z "$OMDB_API_URL" ]]; then
+    warn "No OMDB_API_URL set — titles will use raw disc labels."
+    step "Add one to: $CONF_FILE"
+elif ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+    warn "curl/jq missing — OMDb lookup disabled, using disc labels."
+    step "Install: apt install curl jq"
+else
+    ok "OMDb lookup enabled."
 fi
 
 echo
